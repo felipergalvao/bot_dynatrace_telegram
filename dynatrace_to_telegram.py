@@ -13,8 +13,8 @@ DT_TOKEN = os.environ["DT_TOKEN"]
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 
-# Se não setar DT_UI_BASE, derivamos automaticamente a partir do DT_URL:
-# https://{dominio}/e/{env-id}
+# Base para o link no Dynatrace (Managed)
+# O script tenta derivar de DT_URL: https://{domain}/e/{env-id}
 DT_UI_BASE = os.getenv("DT_UI_BASE", DT_URL.split("/api/v2/problems")[0])
 
 FROM_TIMEFRAME = os.getenv("DT_FROM", "now-7d")
@@ -26,11 +26,16 @@ PERSIST_MS = PERSIST_MIN * 60 * 1000
 # Timezone fixo UTC-3 (BRT)
 TZ_BRT = timezone(timedelta(hours=-3))
 
-# Dedup simples (arquivo no repo + cache do Actions)
+# Dedup (cache do Actions)
 STATE_FILE = os.getenv("STATE_FILE", "sent.json")
 
-# Limites do Telegram (texto máximo ~4096 chars). Vamos chunkar com folga.
-TELEGRAM_MAX_CHARS = 3800
+# Telegram message limit (~4096). Usamos folga.
+TELEGRAM_MAX_CHARS = int(os.getenv("TELEGRAM_MAX_CHARS", "3800"))
+
+# Mostrar no máximo N tags / N evidências
+MAX_TAGS = int(os.getenv("MAX_TAGS", "8"))
+MAX_CAUSES = int(os.getenv("MAX_CAUSES", "2"))
+MAX_SYMPTOMS = int(os.getenv("MAX_SYMPTOMS", "2"))
 
 # =========================
 # Management Zones (OR)
@@ -66,7 +71,7 @@ MZ_NAMES = [
 ]
 
 def build_problem_selector():
-    # Problems API v2: problemSelector aceita status("open") e managementZones("name1","name2",...) (OR) [1](https://docs.dynatrace.com/docs/dynatrace-api/environment-api/problems-v2/problems/get-problems-list)
+    # Problems API v2: status("open") e managementZones("name1","name2",...) (OR)
     quoted_mz = ",".join([f"\"{mz}\"" for mz in MZ_NAMES])
     return f"status(\"open\"),managementZones({quoted_mz})"
 
@@ -78,9 +83,7 @@ def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list):
-            return set(data)
-        return set()
+        return set(data) if isinstance(data, list) else set()
     except FileNotFoundError:
         return set()
 
@@ -93,13 +96,13 @@ def save_state(sent_ids: set):
 # Dynatrace API
 # =========================
 def dt_get_problems_page(next_page_key=None):
-    headers = {
-        "Authorization": f"Api-Token {DT_TOKEN}",
-        "Accept": "application/json",
-    }
+    headers = {"Authorization": f"Api-Token {DT_TOKEN}", "Accept": "application/json"}
 
-    # GET /api/v2/problems com filtros via from/pageSize/problemSelector (ou paginação via nextPageKey) [1](https://docs.dynatrace.com/docs/dynatrace-api/environment-api/problems-v2/problems/get-problems-list)
-    params = {}
+    # GET /api/v2/problems:
+    # - usa from/pageSize/problemSelector para primeira página
+    # - usa nextPageKey nas demais
+    # - "fields" permite pedir evidenceDetails/impactAnalysis/recentComments etc.
+    params = {"fields": "evidenceDetails"}  # <<<<<< habilita causa raiz/sintomas quando disponíveis
     if next_page_key:
         params["nextPageKey"] = next_page_key
     else:
@@ -112,7 +115,6 @@ def dt_get_problems_page(next_page_key=None):
     return r.json()
 
 def dt_get_all_open_problems_filtered():
-    # Busca todas as páginas respeitando nextPageKey [1](https://docs.dynatrace.com/docs/dynatrace-api/environment-api/problems-v2/problems/get-problems-list)
     problems = []
     payload = dt_get_problems_page()
     problems.extend(payload.get("problems", []))
@@ -130,22 +132,105 @@ def dt_get_all_open_problems_filtered():
 # Telegram
 # =========================
 def tg_send_html(text_html: str):
-    # sendMessage do Telegram Bot API com parse_mode HTML [2](https://www.burgersandbytes.nl/blog/20240212teamsannouncementmessage/)[3](https://community.dynatrace.com/t5/Dynatrace-API/Management-Zone-list-through-API/m-p/256644)
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TG_CHAT_ID,
         "text": text_html,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+        "disable_web_page_preview": True
     }
     r = requests.post(url, json=payload, timeout=40)
     r.raise_for_status()
 
+
+# =========================
+# Helpers (tempo, link, parsing)
+# =========================
+def utc_ms_now():
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+def fmt_brt_datetime_from_utc_ms(ms_utc: int) -> str:
+    dt_utc = datetime.fromtimestamp(ms_utc / 1000, tz=timezone.utc)
+    dt_brt = dt_utc.astimezone(TZ_BRT)
+    return dt_brt.strftime("%d/%m/%Y %H:%M:%S (UTC-03)")
+
+def fmt_duration_ms(ms: int) -> str:
+    if ms < 0:
+        ms = 0
+    total_minutes = ms // 60000
+    days = total_minutes // (24 * 60)
+    hours = (total_minutes % (24 * 60)) // 60
+    mins = total_minutes % 60
+    if days > 0:
+        return f"{days}d {hours}h {mins}m"
+    if hours > 0:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+def build_dynatrace_problem_link(problem_id: str) -> str:
+    # Dynatrace Managed deep link clássico: /#problems/problemdetails;pid={ProblemID}
+    return f"{DT_UI_BASE}/#problems/problemdetails;pid={problem_id}"
+
+def extract_mz_names(problem: dict) -> str:
+    mzs = problem.get("managementZones", []) or []
+    names = [z.get("name") for z in mzs if isinstance(z, dict) and z.get("name")]
+    return ", ".join(names) if names else "n/d"
+
+def extract_tags(problem: dict) -> str:
+    # entityTags é lista de tags do problema, com campos como key/value/context/stringRepresentation
+    tags = problem.get("entityTags", []) or []
+    out = []
+    for t in tags:
+        if not isinstance(t, dict):
+            continue
+        # Preferir stringRepresentation se existir
+        s = t.get("stringRepresentation")
+        if not s:
+            # fallback: context:key:value
+            ctx = t.get("context")
+            key = t.get("key")
+            val = t.get("value")
+            if key and val:
+                s = f"[{ctx}]{key}:{val}" if ctx else f"{key}:{val}"
+            elif key:
+                s = f"[{ctx}]{key}" if ctx else key
+        if s:
+            out.append(s)
+        if len(out) >= MAX_TAGS:
+            break
+    return ", ".join(out) if out else "n/d"
+
+def extract_root_cause_and_symptom(problem: dict):
+    """
+    Usa evidenceDetails.details[].rootCauseRelevant (true/false) para separar:
+    - causas (rootCauseRelevant=True)
+    - sintomas (rootCauseRelevant=False)
+    """
+    evidence = (problem.get("evidenceDetails") or {}).get("details", []) or []
+    causes = []
+    symptoms = []
+
+    for ev in evidence:
+        if not isinstance(ev, dict):
+            continue
+        name = ev.get("displayName") or ""
+        ent = ev.get("entity") or {}
+        ent_name = ent.get("name") if isinstance(ent, dict) else None
+        text = name
+        if ent_name and ent_name not in name:
+            text = f"{name} — {ent_name}"
+
+        if ev.get("rootCauseRelevant") is True:
+            causes.append(text)
+        else:
+            symptoms.append(text)
+
+    causes = [c for c in causes if c][:MAX_CAUSES]
+    symptoms = [s for s in symptoms if s][:MAX_SYMPTOMS]
+
+    return causes, symptoms
+
 def chunk_messages(lines, header):
-    """
-    Junta linhas em blocos <= TELEGRAM_MAX_CHARS.
-    Mantém o header no início de cada bloco.
-    """
     chunks = []
     current = header
     for line in lines:
@@ -160,45 +245,50 @@ def chunk_messages(lines, header):
 
 
 # =========================
-# Formatadores
+# Mensagem (digest bonito)
 # =========================
-def fmt_brt_from_utc_ms(ms_utc: int) -> str:
-    # A API entrega timestamps em ms UTC [1](https://docs.dynatrace.com/docs/dynatrace-api/environment-api/problems-v2/problems/get-problems-list)
-    dt_utc = datetime.fromtimestamp(ms_utc / 1000, tz=timezone.utc)
-    dt_brt = dt_utc.astimezone(TZ_BRT)
-    return dt_brt.strftime("%d/%m/%Y %H:%M:%S (UTC-03)")
-
-def build_dynatrace_problem_link(problem_id: str) -> str:
-    # Link direto (Managed): https://{domain}/e/{env-id}/#problems/problemdetails;pid={ProblemID} [4](https://community.dynatrace.com/t5/Dynatrace-API/API-to-get-problem-details-URL/m-p/196958)
-    return f"{DT_UI_BASE}/#problems/problemdetails;pid={problem_id}"
-
-def build_digest(problems_to_send):
+def build_digest(to_send: list, now_ms: int):
     now_brt = datetime.now(TZ_BRT).strftime("%d/%m/%Y %H:%M:%S (UTC-03)")
     header = (
         f"<b>🚨 Dynatrace — Problems persistentes (≥ {PERSIST_MIN} min)</b>\n"
         f"<i>Atualização: {html_escape(now_brt)}</i>\n"
-        f"<i>Total nesta rodada: {len(problems_to_send)}</i>\n\n"
+        f"<i>Total nesta rodada: {len(to_send)}</i>\n\n"
     )
 
     lines = []
-    for i, p in enumerate(problems_to_send, start=1):
+    for i, p in enumerate(to_send, start=1):
         display_id = html_escape(p.get("displayId", ""))
         title = html_escape(p.get("title", ""))
         severity = html_escape(p.get("severityLevel", ""))
         impact = html_escape(p.get("impactLevel", ""))
+        start_ms = p.get("startTime", 0)
 
-        start_ms = p.get("startTime")
-        start_brt = fmt_brt_from_utc_ms(start_ms) if isinstance(start_ms, int) else "n/d"
+        # Tempo aberto + início em UTC-3
+        age_ms = max(0, now_ms - start_ms) if isinstance(start_ms, int) else 0
+        opened_for = fmt_duration_ms(age_ms)
+        start_brt = fmt_brt_datetime_from_utc_ms(start_ms) if isinstance(start_ms, int) else "n/d"
 
-        # NÃO exibimos problemId, mas usamos para montar link clicável
-        problem_id = p.get("problemId", "")
-        link = build_dynatrace_problem_link(problem_id) if problem_id else DT_UI_BASE
+        mz_names = html_escape(extract_mz_names(p))
+        tags = html_escape(extract_tags(p))
 
-        # HTML link clicável
+        # Root cause / symptom (se tiver evidência)
+        causes, symptoms = extract_root_cause_and_symptom(p)
+        causes_txt = html_escape(" | ".join(causes)) if causes else "n/d"
+        symptoms_txt = html_escape(" | ".join(symptoms)) if symptoms else "n/d"
+
+        # Link clicável (não exibimos problemId)
+        pid = p.get("problemId", "")
+        link = build_dynatrace_problem_link(pid) if pid else DT_UI_BASE
+
         line = (
             f"<b>{i}) {display_id} — {title}</b>\n"
             f"Sev: <b>{severity}</b> | Impacto: <b>{impact}</b>\n"
+            f"MZ: <code>{mz_names}</code>\n"
+            f"Tags: <code>{tags}</code>\n"
             f"Início (UTC-03): <code>{html_escape(start_brt)}</code>\n"
+            f"Aberto há: <b>{html_escape(opened_for)}</b>\n"
+            f"Causa raiz (se houver): <code>{causes_txt}</code>\n"
+            f"Sintoma (se houver): <code>{symptoms_txt}</code>\n"
             f"🔗 <a href=\"{html_escape(link)}\">Abrir no Dynatrace</a>"
         )
         lines.append(line)
@@ -211,7 +301,7 @@ def build_digest(problems_to_send):
 # =========================
 def main():
     sent_ids = load_state()
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    now_ms = utc_ms_now()
 
     all_problems = dt_get_all_open_problems_filtered()
 
@@ -237,7 +327,7 @@ def main():
     # Ordena por startTime (mais antigos primeiro)
     to_send.sort(key=lambda x: x.get("startTime", 0))
 
-    header, lines = build_digest(to_send)
+    header, lines = build_digest(to_send, now_ms)
     chunks = chunk_messages(lines, header)
 
     for chunk in chunks:
@@ -246,8 +336,8 @@ def main():
     # Marca como enviado
     for p in to_send:
         sent_ids.add(p["problemId"])
-
     save_state(sent_ids)
+
     print(f"Enviado: {len(to_send)} problems em {len(chunks)} mensagem(ns).")
 
 if __name__ == "__main__":
