@@ -39,6 +39,7 @@ jobs:
           PERSIST_MINUTES: "15"
           DT_FROM: "now-7d"
           DT_PAGE_SIZE: "200"
+          MAX_ENRICH: "25"
         run: python dynatrace_to_telegram.py
 
       - name: Save state cache (sent.json)
