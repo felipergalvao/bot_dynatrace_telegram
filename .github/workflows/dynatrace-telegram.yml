@@ -2,7 +2,7 @@ name: Dynatrace -> Telegram
 
 on:
   schedule:
-    - cron: "2-59/15 * * * *"   # a cada 5 min (UTC)
+    - cron: "*/15 * * * *"   # a cada 5 min (UTC)
   workflow_dispatch: {}
 
 jobs:
