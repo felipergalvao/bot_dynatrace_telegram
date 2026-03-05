@@ -1,0 +1,43 @@
+name: Dynatrace -> Telegram
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # a cada 5 minutos (UTC)
+  workflow_dispatch:        # permite rodar manualmente também
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore state (sent.json)
+        uses: actions/cache@v4
+        with:
+          path: sent.json
+          key: sent-json-${{ github.run_id }}
+          restore-keys: |
+            sent-json-
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run
+        env:
+          DT_URL: ${{ secrets.DT_URL }}
+          DT_TOKEN: ${{ secrets.DT_TOKEN }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python dynatrace_to_telegram.py
+
+      - name: Save state (sent.json)
+        uses: actions/cache@v4
+        with:
+          path: sent.json
+          key: sent-json-${{ github.run_id }}
