@@ -7,7 +7,7 @@ import requests
 # =========================
 # Config via Secrets/ENV
 # =========================
-DT_URL = os.environ["DT_URL"].rstrip("/")  # ex: https://dynatrace-one.enel.com/e/<env>/api/v2/problems
+DT_URL = os.environ["DT_URL"].rstrip("/")  # https://.../api/v2/problems
 DT_TOKEN = os.environ["DT_TOKEN"]
 
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
@@ -17,7 +17,7 @@ TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 DT_UI_BASE = os.getenv("DT_UI_BASE", DT_URL.split("/api/v2/problems")[0])
 
 FROM_TIMEFRAME = os.getenv("DT_FROM", "now-7d")
-PAGE_SIZE = int(os.getenv("DT_PAGE_SIZE", "200"))
+PAGE_SIZE = int(os.getenv("DT_PAGE_SIZE", "200"))  # agora pode ser > 10 pois NÃO usamos fields na lista
 
 PERSIST_MIN = int(os.getenv("PERSIST_MINUTES", "15"))
 PERSIST_MS = PERSIST_MIN * 60 * 1000
@@ -31,10 +31,13 @@ STATE_FILE = os.getenv("STATE_FILE", "sent.json")
 # Telegram message limit (~4096). Folga:
 TELEGRAM_MAX_CHARS = int(os.getenv("TELEGRAM_MAX_CHARS", "3800"))
 
-# Limites de “poluição”
+# Limites para não poluir
 MAX_TAGS = int(os.getenv("MAX_TAGS", "8"))
 MAX_CAUSES = int(os.getenv("MAX_CAUSES", "2"))
 MAX_SYMPTOMS = int(os.getenv("MAX_SYMPTOMS", "2"))
+
+# Limite de enriquecimento por rodada (para não explodir chamadas no /details)
+MAX_ENRICH = int(os.getenv("MAX_ENRICH", "25"))
 
 # =========================
 # Management Zones (OR)
@@ -92,14 +95,17 @@ def save_state(sent_ids: set):
 
 
 # =========================
-# Dynatrace API
+# Dynatrace API (list + details)
 # =========================
-def dt_get_problems_page(next_page_key=None):
-    headers = {"Authorization": f"Api-Token {DT_TOKEN}", "Accept": "application/json"}
+def _dt_headers():
+    return {"Authorization": f"Api-Token {DT_TOKEN}", "Accept": "application/json"}
 
-    # ✅ fields correto: evidenceDetails (com N) [1](https://www.pulumi.com/registry/packages/dynatrace/api-docs/getmanagementzonev2/)
-    params = {"fields": "evidenceDetails"}
-
+def dt_list_problems_page(next_page_key=None):
+    """
+    Lista problems (sem fields extras) para poder usar pageSize alto.
+    GET /api/v2/problems suporta from/pageSize/problemSelector/nextPageKey [1](https://www.pulumi.com/registry/packages/dynatrace/api-docs/getmanagementzonev2/)
+    """
+    params = {}
     if next_page_key:
         params["nextPageKey"] = next_page_key
     else:
@@ -107,31 +113,44 @@ def dt_get_problems_page(next_page_key=None):
         params["pageSize"] = PAGE_SIZE
         params["problemSelector"] = build_problem_selector()
 
-    r = requests.get(DT_URL, headers=headers, params=params, timeout=40)
+    r = requests.get(DT_URL, headers=_dt_headers(), params=params, timeout=40)
     if r.status_code >= 400:
-        # Ajuda debug mostrando corpo do erro do Dynatrace
-        raise RuntimeError(f"Dynatrace HTTP {r.status_code}: {r.text}")
+        raise RuntimeError(f"Dynatrace LIST HTTP {r.status_code}: {r.text}")
     return r.json()
 
-def dt_get_all_open_problems_filtered():
+def dt_list_all_open_problems():
     problems = []
-    payload = dt_get_problems_page()
+    payload = dt_list_problems_page()
     problems.extend(payload.get("problems", []))
     next_key = payload.get("nextPageKey")
 
     while next_key:
-        payload = dt_get_problems_page(next_page_key=next_key)
+        payload = dt_list_problems_page(next_page_key=next_key)
         problems.extend(payload.get("problems", []))
         next_key = payload.get("nextPageKey")
 
     return problems
+
+def dt_get_problem_details(problem_id: str):
+    """
+    Busca detalhes de um problem específico:
+    GET /api/v2/problems/{problemId}?fields=evidenceDetails [2](https://docs.dynatrace.com/docs/dynatrace-api/environment-api/entity-v2/entity-selector)
+    """
+    url = f"{DT_URL}/{problem_id}"
+    params = {"fields": "evidenceDetails"}
+    r = requests.get(url, headers=_dt_headers(), params=params, timeout=40)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Dynatrace DETAILS HTTP {r.status_code}: {r.text}")
+    return r.json()
 
 
 # =========================
 # Telegram
 # =========================
 def tg_send_html(text_html: str):
-    # sendMessage com parse_mode HTML [4](https://rishandigital.com/powerautomate/using-http-requests-in-power-automate-for-api-calls/)[5](https://www.youtube.com/watch?v=uZPuSMdcuLY)
+    """
+    Telegram Bot API sendMessage com parse_mode=HTML [4](https://rishandigital.com/powerautomate/using-http-requests-in-power-automate-for-api-calls/)[5](https://www.youtube.com/watch?v=uZPuSMdcuLY)
+    """
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TG_CHAT_ID,
@@ -169,7 +188,7 @@ def fmt_duration_ms(ms: int) -> str:
     return f"{mins}m"
 
 def build_dynatrace_problem_link(problem_id: str) -> str:
-    # Link direto (Managed): /#problems/problemdetails;pid={ProblemID} [3](https://community.dynatrace.com/t5/Container-platforms/How-to-select-multiple-entityName-startsWith-statements/m-p/279026)
+    # Dynatrace Managed deep link clássico: /#problems/problemdetails;pid={ProblemID} [3](https://community.dynatrace.com/t5/Container-platforms/How-to-select-multiple-entityName-startsWith-statements/m-p/279026)
     return f"{DT_UI_BASE}/#problems/problemdetails;pid={problem_id}"
 
 def extract_mz_names(problem: dict) -> str:
@@ -198,9 +217,11 @@ def extract_tags(problem: dict) -> str:
             break
     return ", ".join(out) if out else "n/d"
 
-def extract_root_cause_and_symptom(problem: dict):
-    # evidenceDetails.details[] vem quando fields=evidenceDetails [1](https://www.pulumi.com/registry/packages/dynatrace/api-docs/getmanagementzonev2/)[2](https://docs.dynatrace.com/docs/dynatrace-api/environment-api/entity-v2/entity-selector)
-    evidence = (problem.get("evidenceDetails") or {}).get("details", []) or []
+def extract_root_cause_and_symptom_from_details(problem_details: dict):
+    """
+    Usa evidenceDetails.details[].rootCauseRelevant (true/false) para separar causa vs sintoma. [2](https://docs.dynatrace.com/docs/dynatrace-api/environment-api/entity-v2/entity-selector)
+    """
+    evidence = (problem_details.get("evidenceDetails") or {}).get("details", []) or []
     causes, symptoms = [], []
 
     for ev in evidence:
@@ -237,16 +258,20 @@ def chunk_messages(lines, header):
 # =========================
 # Mensagem (digest bonito) — MZ como prioridade
 # =========================
-def build_digest(to_send: list, now_ms: int):
+def build_digest(enriched_items: list, now_ms: int):
     now_brt = datetime.now(TZ_BRT).strftime("%d/%m/%Y %H:%M:%S (UTC-03)")
     header = (
         f"<b>🚨 Dynatrace — Problems persistentes (≥ {PERSIST_MIN} min)</b>\n"
         f"<i>Atualização: {html_escape(now_brt)}</i>\n"
-        f"<i>Total nesta rodada: {len(to_send)}</i>\n\n"
+        f"<i>Total nesta rodada: {len(enriched_items)}</i>\n\n"
     )
 
     lines = []
-    for i, p in enumerate(to_send, start=1):
+    for i, item in enumerate(enriched_items, start=1):
+        p = item["problem"]
+        causes = item.get("causes") or []
+        symptoms = item.get("symptoms") or []
+
         display_id = html_escape(p.get("displayId", ""))
         title = html_escape(p.get("title", ""))
         severity = html_escape(p.get("severityLevel", ""))
@@ -260,7 +285,6 @@ def build_digest(to_send: list, now_ms: int):
         mz_names = html_escape(extract_mz_names(p))  # ⭐ prioridade
         tags = html_escape(extract_tags(p))
 
-        causes, symptoms = extract_root_cause_and_symptom(p)
         causes_txt = html_escape(" | ".join(causes)) if causes else "n/d"
         symptoms_txt = html_escape(" | ".join(symptoms)) if symptoms else "n/d"
 
@@ -290,9 +314,10 @@ def main():
     sent_ids = load_state()
     now_ms = utc_ms_now()
 
-    all_problems = dt_get_all_open_problems_filtered()
+    all_problems = dt_list_all_open_problems()
 
-    to_send = []
+    # Filtra por persistência >= 15 min e dedup por problemId
+    candidates = []
     for p in all_problems:
         pid = p.get("problemId")
         if not pid or pid in sent_ids:
@@ -303,25 +328,41 @@ def main():
             continue
 
         if (now_ms - start_ms) >= PERSIST_MS:
-            to_send.append(p)
+            candidates.append(p)
 
-    if not to_send:
+    if not candidates:
         print("Nada para enviar.")
         return
 
-    to_send.sort(key=lambda x: x.get("startTime", 0))
+    # Ordena por startTime (mais antigos primeiro)
+    candidates.sort(key=lambda x: x.get("startTime", 0))
 
-    header, lines = build_digest(to_send, now_ms)
+    # Enriquecimento (detalhes) só até MAX_ENRICH para evitar excesso
+    enriched = []
+    for p in candidates[:MAX_ENRICH]:
+        pid = p["problemId"]
+        try:
+            details = dt_get_problem_details(pid)  # GET /api/v2/problems/{problemId} [2](https://docs.dynatrace.com/docs/dynatrace-api/environment-api/entity-v2/entity-selector)
+            causes, symptoms = extract_root_cause_and_symptom_from_details(details)
+        except Exception as e:
+            # Se falhar detalhes, não bloqueia envio
+            causes, symptoms = [], []
+            print(f"[WARN] Falha ao enriquecer {pid}: {e}")
+
+        enriched.append({"problem": p, "causes": causes, "symptoms": symptoms})
+
+    header, lines = build_digest(enriched, now_ms)
     chunks = chunk_messages(lines, header)
 
     for chunk in chunks:
-        tg_send_html(chunk)
+        tg_send_html(chunk)  # sendMessage HTML [4](https://rishandigital.com/powerautomate/using-http-requests-in-power-automate-for-api-calls/)[5](https://www.youtube.com/watch?v=uZPuSMdcuLY)
 
-    for p in to_send:
+    # Marca como enviado (para todos candidates, inclusive os não enriquecidos)
+    for p in candidates:
         sent_ids.add(p["problemId"])
     save_state(sent_ids)
 
-    print(f"Enviado: {len(to_send)} problems em {len(chunks)} mensagem(ns).")
+    print(f"Enviado: {len(candidates)} problems (enriquecidos: {len(enriched)}) em {len(chunks)} mensagem(ns).")
 
 if __name__ == "__main__":
     main()
