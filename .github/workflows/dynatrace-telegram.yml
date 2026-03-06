@@ -14,10 +14,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Restore state cache (sent.json)
+      - name: Restore state cache (state.json)
         uses: actions/cache@v4
         with:
-          path: sent.json
+          path: state.json
           key: dt-state-${{ github.run_id }}
           restore-keys: |
             dt-state-
@@ -49,8 +49,8 @@ jobs:
           MAX_DETAILS: "20"
         run: python dynatrace_to_telegram.py
 
-      - name: Save state cache (sent.json)
+      - name: Save state cache (state.json)
         uses: actions/cache@v4
         with:
-          path: sent.json
+          path: state.json
           key: dt-state-${{ github.run_id }}
